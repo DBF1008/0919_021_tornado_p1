@@ -2684,13 +2684,8 @@ class IncorrectContentLengthTest(SimpleHandlerTestCase):
         # closed without completing the response.  An error is logged on
         # the server.
         with ExpectLog(app_log, "(Uncaught exception|Exception in callback)"):
-            with ExpectLog(
-                gen_log,
-                "(Cannot send error response after headers written"
-                "|Failed to flush partial response)",
-            ):
-                with self.assertRaises(HTTPClientError):
-                    self.fetch("/high", raise_error=True)
+            with self.assertRaises(HTTPClientError):
+                self.fetch("/high", raise_error=True)
         self.assertEqual(
             str(self.server_error), "Tried to write 40 bytes less than Content-Length"
         )
@@ -2700,13 +2695,8 @@ class IncorrectContentLengthTest(SimpleHandlerTestCase):
         # without writing the last chunk, so the client never sees the request
         # complete (which would be a framing error).
         with ExpectLog(app_log, "(Uncaught exception|Exception in callback)"):
-            with ExpectLog(
-                gen_log,
-                "(Cannot send error response after headers written"
-                "|Failed to flush partial response)",
-            ):
-                with self.assertRaises(HTTPClientError):
-                    self.fetch("/low", raise_error=True)
+            with self.assertRaises(HTTPClientError):
+                self.fetch("/low", raise_error=True)
         self.assertEqual(
             str(self.server_error), "Tried to write more data than Content-Length"
         )

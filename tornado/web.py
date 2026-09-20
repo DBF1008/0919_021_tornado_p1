@@ -1212,7 +1212,6 @@ class RequestHandler:
         chunk = b"".join(self._write_buffer)
         self._write_buffer = []
         if not self._headers_written:
-            self._headers_written = True
             for transform in self._transforms:
                 assert chunk is not None
                 (
@@ -1234,9 +1233,16 @@ class RequestHandler:
                     self.add_header("Set-Cookie", cookie.OutputString(None))
 
             start_line = httputil.ResponseStartLine("", self._status_code, self._reason)
-            return self.request.connection.write_headers(
+            future = self.request.connection.write_headers(
                 start_line, self._headers, chunk
             )
+            # Only mark the headers as written once the transform chain
+            # and write_headers have completed without raising. If a
+            # transform fails here no bytes have been sent yet, and the
+            # error handling path must still be allowed to send a
+            # consistent error response.
+            self._headers_written = True
+            return future
         else:
             for transform in self._transforms:
                 chunk = transform.transform_chunk(chunk, include_footers)
@@ -1291,19 +1297,78 @@ class RequestHandler:
                 self.set_header("Content-Length", content_length)
 
         assert self.request.connection is not None
-        # Now that the request is finished, clear the callback we
-        # set on the HTTPConnection (which would otherwise prevent the
-        # garbage collection of the RequestHandler when there
-        # are keepalive connections)
-        self.request.connection.set_close_callback(None)  # type: ignore
+        try:
+            future = self.flush(include_footers=True)
+            self.request.connection.finish()
+        except Exception:
+            # The response could not be completed cleanly (for example a
+            # transform failed or the body does not match the declared
+            # Content-Length). The framing state of the connection can no
+            # longer be trusted, so abort it instead of leaving a
+            # keepalive connection to be reused in a desynchronized
+            # state.
+            self._abort()
+            raise
+        finally:
+            # Now that the request is finished, clear the callback we
+            # set on the HTTPConnection (which would otherwise prevent the
+            # garbage collection of the RequestHandler when there
+            # are keepalive connections)
+            self._clear_close_callback()
 
-        future = self.flush(include_footers=True)
-        self.request.connection.finish()
         self._log()
         self._finished = True
         self.on_finish()
         self._break_cycles()
         return future
+
+    def _abort(self) -> None:
+        """Abort the response and close the connection.
+
+        Used when an error occurs after part of the response has already
+        been sent (or the response cannot be completed cleanly). The
+        connection is closed without terminating the HTTP framing, so the
+        client observes a truncated response (a network-level error)
+        instead of a seemingly successful one, and a keepalive connection
+        is never reused in a desynchronized state.
+        """
+        if self._finished:
+            return
+        self._finished = True
+        self._clear_close_callback()
+        assert self.request.connection is not None
+        # TODO: need to add close to the HTTPConnection interface
+        stream = getattr(self.request.connection, "stream", None)
+        if stream is not None and not stream.closed():
+            stream.close()
+        self._log()
+        self.on_finish()
+        self._break_cycles()
+
+    def _clear_close_callback(self) -> None:
+        """Clear the close callback registered on the connection.
+
+        If the connection has already been closed while our callback was
+        still registered (i.e. the ioloop has not had a chance to deliver
+        the notification yet), deliver it ourselves first so that
+        resources associated with the connection are not leaked silently.
+        """
+        connection = self.request.connection
+        if connection is None:
+            return
+        stream = getattr(connection, "stream", None)
+        if (
+            stream is not None
+            and stream.closed()
+            and getattr(connection, "_close_callback", None) is not None
+        ):
+            try:
+                self.on_connection_close()
+            except Exception:
+                app_log.error(
+                    "Uncaught exception in on_connection_close", exc_info=True
+                )
+        connection.set_close_callback(None)  # type: ignore
 
     def detach(self) -> iostream.IOStream:
         """Take control of the underlying stream.
@@ -1329,7 +1394,10 @@ class RequestHandler:
         """Sends the given HTTP error code to the browser.
 
         If `flush()` has already been called, it is not possible to send
-        an error, so this method will simply terminate the response.
+        an error, so this method will simply terminate the response by
+        closing the connection (the client will observe a truncated
+        response as a network error).
+
         If output has been written but not yet flushed, it will be discarded
         and replaced with the error page.
 
@@ -1339,14 +1407,16 @@ class RequestHandler:
         if self._headers_written:
             gen_log.error("Cannot send error response after headers written")
             if not self._finished:
-                # If we get an error between writing headers and finishing,
-                # we are unlikely to be able to finish due to a
-                # Content-Length mismatch. Try anyway to release the
-                # socket.
-                try:
-                    self.finish()
-                except Exception:
-                    gen_log.error("Failed to flush partial response", exc_info=True)
+                # The status line and headers have already been sent, so
+                # it is no longer possible to send a consistent error
+                # response. Writing more data or finishing cleanly would
+                # misrepresent the failed response as a successful one
+                # (and could desynchronize a keepalive connection, e.g.
+                # when the declared Content-Length does not match the
+                # bytes actually sent, or when a gzip stream is left
+                # incomplete). Abort the connection instead: the client
+                # will observe a truncated response as a network error.
+                self._abort()
             return
         self.clear()
 
@@ -3299,6 +3369,8 @@ class GZipContentEncoding(OutputTransform):
 
     def __init__(self, request: httputil.HTTPServerRequest) -> None:
         self._gzipping = "gzip" in request.headers.get("Accept-Encoding", "")
+        self._gzip_value: BytesIO | None = None
+        self._gzip_file: gzip.GzipFile | None = None
 
     def _compressible_type(self, ctype: str) -> bool:
         return ctype.startswith("text/") or ctype in self.CONTENT_TYPES
@@ -3342,6 +3414,17 @@ class GZipContentEncoding(OutputTransform):
 
     def transform_chunk(self, chunk: bytes, finishing: bool) -> bytes:
         if self._gzipping:
+            if self._gzip_file is None or self._gzip_value is None:
+                # The gzip stream was never initialized (or was torn down
+                # after an error). Raising here (instead of failing with
+                # an obscure AttributeError or silently passing the chunk
+                # through uncompressed) lets the error handling path abort
+                # the connection so the client does not receive a corrupt
+                # or mislabeled body.
+                raise httputil.HTTPOutputError(
+                    "gzip transform received a chunk before the gzip "
+                    "stream was initialized"
+                )
             self._gzip_file.write(chunk)
             if finishing:
                 self._gzip_file.close()
