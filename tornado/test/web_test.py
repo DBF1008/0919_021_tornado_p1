@@ -14,6 +14,7 @@ import typing
 import unittest
 import urllib.parse
 from io import BytesIO
+from unittest.mock import Mock
 
 from tornado import gen, locale
 from tornado.concurrent import Future
@@ -27,6 +28,7 @@ from tornado.escape import (
 )
 from tornado.httpclient import HTTPClientError
 from tornado.httputil import format_timestamp
+from tornado.httputil import HTTPServerRequest
 from tornado.iostream import IOStream
 from tornado.locks import Event
 from tornado.log import app_log, gen_log
@@ -42,6 +44,7 @@ from tornado.web import (
     GZipContentEncoding,
     HTTPError,
     MissingArgumentError,
+    OutputTransform,
 )
 from tornado.web import RedirectHandler as WebRedirectHandler
 from tornado.web import (
@@ -1982,6 +1985,83 @@ class GzipTestCase(SimpleHandlerTestCase):
             [s.strip() for s in response.headers["Vary"].split(",")],
             ["Accept-Language", "Cookie", "Accept-Encoding"],
         )
+
+
+class BrokenTransformTest(SimpleHandlerTestCase):
+    # Regression tests for the interaction between the error-handling
+    # path and the output transform chain: a failing transform must not
+    # leave the response in an inconsistent state (conflicting status
+    # lines, silently corrupt gzip streams, or leaked connections).
+    class FirstChunkHandler(RequestHandler):
+        def get(self):
+            self.write("hello")
+            # finish() (via _auto_finish) flushes; the transform fails
+            # before anything reaches the network, so a clean error
+            # response must still be deliverable.
+
+    class MidStreamHandler(RequestHandler):
+        def get(self):
+            self.write("first")
+            self.flush()
+            self.write("second")
+            # The auto-finish flush hits the failing transform after
+            # headers (and a partial body) have already been sent.
+
+    def get_handlers(self):
+        return [
+            ("/first", self.FirstChunkHandler),
+            ("/mid", self.MidStreamHandler),
+        ]
+
+    def get_app_kwargs(self):
+        test = self
+        self.fail_first = False
+        self.fail_mid = False
+
+        class FlakyTransform(OutputTransform):
+            def transform_first_chunk(self, status_code, headers, chunk, finishing):
+                if test.fail_first:
+                    raise ValueError("transform failed on first chunk")
+                return status_code, headers, chunk
+
+            def transform_chunk(self, chunk, finishing):
+                if test.fail_mid and finishing:
+                    raise ValueError("transform failed mid-stream")
+                return chunk
+
+        return dict(transforms=[FlakyTransform])
+
+    def test_first_chunk_transform_failure(self):
+        # The transform fails before any bytes are sent; the client must
+        # receive a single, consistent 500 response.
+        self.fail_first = True
+        with ExpectLog(app_log, "Uncaught exception"):
+            response = self.fetch("/first", raise_error=False)
+        self.assertEqual(response.code, 500)
+
+    def test_mid_stream_transform_failure(self):
+        # The transform fails after headers were sent; the response
+        # cannot be completed, so the connection is aborted and the
+        # client sees an error instead of silently truncated data.
+        self.fail_mid = True
+        with ExpectLog(app_log, "Uncaught exception"):
+            with ExpectLog(gen_log, "Cannot send error response after headers written"):
+                with self.assertRaises(HTTPClientError):
+                    self.fetch("/mid")
+
+    def test_close_callback_cleared_exactly_once(self):
+        # The close callback registered in __init__ must be released
+        # exactly once even when the finish and error paths interleave.
+        connection = Mock()
+        request = HTTPServerRequest(method="GET", uri="/", connection=connection)
+        handler = self.FirstChunkHandler(Application(), request)
+        handler._transforms = []
+        handler.finish()
+        connection.set_close_callback.assert_called_with(None)
+        call_count = connection.set_close_callback.call_count
+        handler._clear_close_callback()
+        handler._clear_close_callback()
+        self.assertEqual(connection.set_close_callback.call_count, call_count)
 
 
 class PathArgsInPrepareTest(WebTestCase):

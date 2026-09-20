@@ -207,6 +207,14 @@ class RequestHandler:
         self._finished = False
         self._auto_finish = True
         self._prepared_future = None
+        # Set when a transform in the output chain fails after headers
+        # (and possibly partial body) have been sent.  Once set, no more
+        # bytes may be emitted and the connection must be aborted.
+        self._output_broken = False
+        # Tracks whether the connection's close callback has been
+        # released, so that the normal finish path and the error/abort
+        # paths cannot clear it twice or prematurely.
+        self._close_callback_cleared = False
         self.ui = ObjectDict(
             (n, self._ui_method(m)) for n, m in application.ui_methods.items()
         )
@@ -1209,19 +1217,35 @@ class RequestHandler:
            The ``callback`` argument was removed.
         """
         assert self.request.connection is not None
+        if self._output_broken:
+            raise RuntimeError(
+                "flush() called after the output transform chain broke; "
+                "the response cannot be completed and the connection "
+                "must be aborted"
+            )
         chunk = b"".join(self._write_buffer)
         self._write_buffer = []
         if not self._headers_written:
             self._headers_written = True
-            for transform in self._transforms:
-                assert chunk is not None
-                (
-                    self._status_code,
-                    self._headers,
-                    chunk,
-                ) = transform.transform_first_chunk(
-                    self._status_code, self._headers, chunk, include_footers
-                )
+            try:
+                for transform in self._transforms:
+                    assert chunk is not None
+                    (
+                        self._status_code,
+                        self._headers,
+                        chunk,
+                    ) = transform.transform_first_chunk(
+                        self._status_code, self._headers, chunk, include_footers
+                    )
+            except Exception:
+                # A transform failed before anything was sent to the
+                # network.  Roll back the output-chain state so the
+                # error-handling path can still send a consistent error
+                # response (otherwise the client would receive either no
+                # response at all or a second, conflicting status line).
+                self._headers_written = False
+                self._transforms = []
+                raise
             # Ignore the chunk and only write the headers for HEAD requests
             if self.request.method == "HEAD":
                 chunk = b""
@@ -1238,8 +1262,20 @@ class RequestHandler:
                 start_line, self._headers, chunk
             )
         else:
-            for transform in self._transforms:
-                chunk = transform.transform_chunk(chunk, include_footers)
+            try:
+                for transform in self._transforms:
+                    chunk = transform.transform_chunk(chunk, include_footers)
+            except Exception:
+                # A transform (e.g. GZipContentEncoding) failed in the
+                # middle of the response: the partial output already sent
+                # can never be completed into a valid stream.  Mark the
+                # output chain as broken so no further bytes are emitted
+                # and the error propagates to the caller (which aborts
+                # the connection, making the failure visible to the
+                # client instead of silently delivering corrupt data).
+                self._output_broken = True
+                self._transforms = []
+                raise
             # Ignore the chunk and only write the headers for HEAD requests
             if self.request.method != "HEAD":
                 return self.request.connection.write(chunk)
@@ -1295,7 +1331,7 @@ class RequestHandler:
         # set on the HTTPConnection (which would otherwise prevent the
         # garbage collection of the RequestHandler when there
         # are keepalive connections)
-        self.request.connection.set_close_callback(None)  # type: ignore
+        self._clear_close_callback()
 
         future = self.flush(include_footers=True)
         self.request.connection.finish()
@@ -1325,6 +1361,35 @@ class RequestHandler:
         # _ui_module closures to allow for faster GC on CPython.
         self.ui = None  # type: ignore
 
+    def _clear_close_callback(self) -> None:
+        # Release the close callback we registered on the connection in
+        # __init__.  This must happen exactly once: the normal finish
+        # path and the error/abort paths can race on keepalive
+        # connections, and clearing the callback prematurely (or twice)
+        # would hide a connection close from the upper layers and leak
+        # the resources they attach to the handler.
+        if self._close_callback_cleared:
+            return
+        self._close_callback_cleared = True
+        if self.request.connection is not None:
+            self.request.connection.set_close_callback(None)  # type: ignore
+
+    def _abort_connection(self) -> None:
+        # Abort the connection after an unrecoverable output error.
+        # Once part of the response has been sent, closing the
+        # connection is the only way to signal an error to the client:
+        # the truncated body (e.g. a missing gzip trailer or final
+        # chunk) makes the failure visible instead of silently
+        # delivering corrupt or incomplete data.  This method never
+        # touches the close callback itself; releasing it is the
+        # responsibility of _clear_close_callback so the two paths
+        # cannot race.
+        try:
+            if self.request.connection is not None:
+                self.request.connection.close()  # type: ignore
+        except Exception:
+            gen_log.error("Failed to abort connection", exc_info=True)
+
     def send_error(self, status_code: int = 500, **kwargs: Any) -> None:
         """Sends the given HTTP error code to the browser.
 
@@ -1339,14 +1404,25 @@ class RequestHandler:
         if self._headers_written:
             gen_log.error("Cannot send error response after headers written")
             if not self._finished:
-                # If we get an error between writing headers and finishing,
-                # we are unlikely to be able to finish due to a
-                # Content-Length mismatch. Try anyway to release the
-                # socket.
-                try:
-                    self.finish()
-                except Exception:
-                    gen_log.error("Failed to flush partial response", exc_info=True)
+                if self._output_broken:
+                    # The transform chain (e.g. gzip) failed mid-stream;
+                    # the partial output cannot be completed into a valid
+                    # response.  Abort the connection so the client sees
+                    # a truncated response instead of hanging or
+                    # silently accepting corrupt data.
+                    self._abort_connection()
+                else:
+                    # If we get an error between writing headers and finishing,
+                    # we are unlikely to be able to finish due to a
+                    # Content-Length mismatch. Try anyway to release the
+                    # socket.
+                    try:
+                        self.finish()
+                    except Exception:
+                        gen_log.error(
+                            "Failed to flush partial response", exc_info=True
+                        )
+                        self._abort_connection()
             return
         self.clear()
 
